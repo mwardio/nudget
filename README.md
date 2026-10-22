@@ -51,8 +51,8 @@ can hand to someone else.
 If you want **Launch at Login** to keep working across rebuilds, move
 `Nudget.app` into `/Applications` (or `~/Applications`) before turning it on.
 
-Releases are cut by GitHub Actions: pushing a `v*` tag builds, notarizes, and
-publishes the zip. See `.github/workflows/release.yml`.
+Releases are cut from my Mac with `./release.sh <version>`, which signs with
+the Developer ID, notarizes and staples the app, and publishes the zip.
 
 ## Accessibility permission
 

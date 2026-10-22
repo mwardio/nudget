@@ -1,0 +1,121 @@
+name: Release
+
+# Pushing a tag like v1.2.0 builds a universal Nudget.app, signs it with the
+# Developer ID certificate, notarizes and staples it, and publishes the zip as
+# a GitHub release.
+#
+# Required repository secrets:
+#   MACOS_CERTIFICATE_P12_BASE64   Developer ID Application certificate and
+#                                  private key, exported from Keychain Access
+#                                  as .p12 and base64-encoded.
+#   MACOS_CERTIFICATE_PASSWORD     Password chosen during that export.
+#   APP_STORE_CONNECT_KEY_ID       App Store Connect API key ID.
+#   APP_STORE_CONNECT_ISSUER_ID    App Store Connect issuer ID.
+#   APP_STORE_CONNECT_PRIVATE_KEY  Contents of the API key's .p8 file.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: Build, notarize, and publish
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Import Developer ID certificate
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          keychain_password="$(uuidgen)"
+          certificate="$RUNNER_TEMP/certificate.p12"
+
+          echo "$CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychain -d user -s "$keychain"
+          rm -f "$certificate"
+
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          if [ -z "$identity" ]; then
+            echo "No 'Developer ID Application' identity found in the imported certificate." >&2
+            exit 1
+          fi
+          echo "Signing as: $identity"
+          echo "CODESIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          NUDGET_VERSION="${GITHUB_REF_NAME#v}" NUDGET_BUILD="$GITHUB_RUN_NUMBER" ./build.sh
+
+      - name: Notarize and staple
+        env:
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          key_path="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s\n' "$PRIVATE_KEY" > "$key_path"
+          notary_args=(--key "$key_path" --key-id "$KEY_ID" --issuer "$ISSUER_ID")
+
+          submission_zip="$RUNNER_TEMP/notarize.zip"
+          result="$RUNNER_TEMP/notarization.json"
+          ditto -c -k --keepParent build/Nudget.app "$submission_zip"
+          xcrun notarytool submit "$submission_zip" "${notary_args[@]}" --wait --output-format json > "$result" || true
+          cat "$result"
+
+          status="$(jq -r '.status // empty' "$result")"
+          if [ "$status" != "Accepted" ]; then
+            submission_id="$(jq -r '.id // empty' "$result")"
+            if [ -n "$submission_id" ]; then
+              xcrun notarytool log "$submission_id" "${notary_args[@]}"
+            fi
+            echo "Notarization did not succeed (status: ${status:-unknown})." >&2
+            rm -f "$key_path"
+            exit 1
+          fi
+          rm -f "$key_path"
+
+          xcrun stapler staple build/Nudget.app
+          spctl --assess --type exec --verbose=2 build/Nudget.app
+
+      - name: Package
+        run: |
+          zip_name="Nudget-${GITHUB_REF_NAME#v}.zip"
+          ditto -c -k --keepParent build/Nudget.app "$zip_name"
+          shasum -a 256 "$zip_name" > "$zip_name.sha256"
+          cat "$zip_name.sha256"
+          echo "ZIP_NAME=$zip_name" >> "$GITHUB_ENV"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$ZIP_NAME" "$ZIP_NAME.sha256" \
+            --verify-tag \
+            --title "Nudget ${GITHUB_REF_NAME#v}" \
+            --generate-notes
+
+      - name: Remove signing keychain
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN_PATH:-}" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi
